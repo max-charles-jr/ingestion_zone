@@ -1,0 +1,515 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cloud Data Ingestion Zone (TESU CLD-410) - provisions the architecture from
+  the Software Design Document: a Squid Proxy in a public subnet, an internal
+  Network Load Balancer in front of the Proxy, three S3 "Storage Container"
+  buckets reachable from the private subnet via an S3 Gateway VPC Endpoint,
+  and a private ingestion Linux instance with an IAM instance role. See SWDD
+  Section 3 (architecture) and Section 7 (manual runbook this template
+  automates).
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair used for emergency SSH access to the Proxy instance.
+
+  AdminCidr:
+    Type: String
+    Description: Your IP address in CIDR form (e.g. 203.0.113.4/32), allowed to SSH into the Proxy. Never leave this as 0.0.0.0/0.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR block, e.g. 203.0.113.4/32.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM public parameter that always resolves to the latest Amazon Linux 2023 AMI for the deployment region.
+
+  ProxyInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type for the Squid Proxy EC2 instance.
+
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type for the ingestion instance.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+Resources:
+  # -------------------------------------------------------------------
+  # 7.1  VPC, Subnets, Internet Gateway, Route Tables
+  # -------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ingest-zone-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      #AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: "us-east-1a"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ingest-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      #AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: "us-east-1b"
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ingest-private-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ingest-igw
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ingest-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private route table intentionally has NO 0.0.0.0/0 route: the private
+  # subnet (Load Balancer, Storage access, ingestion instance) can only reach the
+  # internet indirectly, through the Proxy chain described in SWDD 3.1.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ingest-private-rt
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------------------------------------------------------
+  # 7.2  Security Groups
+  # -------------------------------------------------------------------
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Squid proxy - inbound 3128 from the VPC, SSH from admin IP only"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3128
+          ToPort: 3128
+          CidrIp: !Ref VpcCidr
+          #Description: "Proxy traffic from anything inside the VPC (relayed via the NLB)"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+          #Description: "Emergency SSH from the admin's own IP only"
+      Tags:
+        - Key: Name
+          Value: ingest-proxy-sg
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Ingestion instance - no inbound rules, the instance never accepts connections"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ingest-instance-sg
+
+  # -------------------------------------------------------------------
+  # 7.5  Storage Containers - three S3 buckets
+  # -------------------------------------------------------------------
+  StorageBucketA:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ingest-zone-storage-a-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: ingest-zone-storage-a
+
+  StorageBucketB:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ingest-zone-storage-b-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: ingest-zone-storage-b
+
+  StorageBucketC:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ingest-zone-storage-c-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: ingest-zone-storage-c
+
+  # -------------------------------------------------------------------
+  # 7.6  S3 Gateway VPC Endpoint - "attaches" the three buckets to the
+  #      private route table shared by the Load Balancer and the instance
+  # -------------------------------------------------------------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt StorageBucketA.Arn
+              - !Sub "${StorageBucketA.Arn}/*"
+              - !GetAtt StorageBucketB.Arn
+              - !Sub "${StorageBucketB.Arn}/*"
+              - !GetAtt StorageBucketC.Arn
+              - !Sub "${StorageBucketC.Arn}/*"
+
+  # -------------------------------------------------------------------
+  # 7.7  IAM role for the ingestion instance (least privilege: 3 buckets only)
+  # -------------------------------------------------------------------
+  IngestionEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-storage-write
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt StorageBucketA.Arn
+                  - !Sub "${StorageBucketA.Arn}/*"
+                  - !GetAtt StorageBucketB.Arn
+                  - !Sub "${StorageBucketB.Arn}/*"
+                  - !GetAtt StorageBucketC.Arn
+                  - !Sub "${StorageBucketC.Arn}/*"
+      Tags:
+        - Key: Name
+          Value: ingestion-instance-role
+
+  IngestionEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref IngestionEC2Role
+
+  # -------------------------------------------------------------------
+  # 7.3  Proxy - EC2 + Squid, public subnet, Elastic IP
+  # -------------------------------------------------------------------
+  ProxyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref ProxyInstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref ProxySecurityGroup
+      Tags:
+        - Key: Name
+          Value: ingest-proxy
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+           dnf install -y squid
+           cat >> /etc/squid/squid.conf << 'CONF'
+           acl vpc_net src ${VpcCidr}
+           http_access allow vpc_net
+           http_access deny all
+           http_port 3128
+           CONF
+           systemctl enable squid
+           systemctl restart squid
+
+  ProxyElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref ProxyInstance
+      Tags:
+        - Key: Name
+          Value: ingest-proxy-eip
+
+  # -------------------------------------------------------------------
+  # 7.4  Load Balancer - internal Network Load Balancer in front of Proxy
+  # -------------------------------------------------------------------
+  ProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ingest-proxy-tg
+      Protocol: TCP
+      Port: 3128
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckPort: "3128"
+      Targets:
+        - Id: !Ref ProxyInstance
+          Port: 3128
+      Tags:
+        - Key: Name
+          Value: ingest-proxy-tg
+
+  ProxyNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ingest-proxy-nlb
+      Type: network
+      Scheme: internal
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PrivateSubnet
+      Tags:
+        - Key: Name
+          Value: ingest-proxy-nlb
+
+  ProxyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ProxyNetworkLoadBalancer
+      Protocol: TCP
+      Port: 3128
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProxyTargetGroup
+
+  # -------------------------------------------------------------------
+  # 7.8  Ingestion instance - private subnet, IAM role, /data_ingest, Python env
+  #
+  # The private subnet has no route to the internet (see PrivateRouteTable
+  # above), so dnf and pip are pointed at the Squid Proxy through the NLB's
+  # own DNS name -- the instance's package installation itself proves the
+  # Proxy + Load Balancer egress path works, exactly as SWDD Section 3.3
+  # describes. ingestion_config.py is written out with the real, deployed
+  # NLB DNS name and bucket names already filled in.
+  # -------------------------------------------------------------------
+  IngestionEC2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ProxyListener
+      - S3GatewayEndpoint
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref IngestionEC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: ingest-instance
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              PROXY_URL="http://${NlbDns}:3128"
+              echo "proxy=$PROXY_URL" >> /etc/dnf/dnf.conf
+              export http_proxy=$PROXY_URL
+              export https_proxy=$PROXY_URL
+
+              dnf install -y python3.11 python3.11-pip
+
+              mkdir -p /data_ingest/logs
+              chown -R ec2-user:ec2-user /data_ingest
+              chmod 750 /data_ingest /data_ingest/logs
+
+              python3.11 -m venv /data_ingest/venv
+              /data_ingest/venv/bin/pip install --proxy $PROXY_URL --upgrade pip
+              /data_ingest/venv/bin/pip install --proxy $PROXY_URL boto3 requests beautifulsoup4 lxml
+
+              cat > /etc/profile.d/ingestion_env.sh << 'ENVEOF'
+              export INGEST_LB_DNS="${NlbDns}"
+              export INGEST_S3_BUCKETS="${BucketA},${BucketB},${BucketC}"
+              export INGEST_AWS_REGION="${AWS::Region}"
+              ENVEOF
+              chmod 644 /etc/profile.d/ingestion_env.sh
+
+              cat > /data_ingest/ingestion_config.py << 'PYEOF'
+              #!/usr/bin/env python3
+              """ingestion_config.py -- deployed by CloudFormation with real values baked in."""
+              import os
+
+              LOAD_BALANCER_DNS = os.environ.get("INGEST_LB_DNS", "${NlbDns}")
+              PROXY_PORT = int(os.environ.get("INGEST_PROXY_PORT", "3128"))
+              PROXY_URL = f"http://{LOAD_BALANCER_DNS}:{PROXY_PORT}"
+              PROXIES = {"http": PROXY_URL, "https": PROXY_URL}
+
+              S3_BUCKETS = os.environ.get(
+                  "INGEST_S3_BUCKETS", "${BucketA},${BucketB},${BucketC}"
+              ).split(",")
+              AWS_REGION = os.environ.get("INGEST_AWS_REGION", "${AWS::Region}")
+
+              DATA_INGEST_DIR = os.environ.get("INGEST_HOME", "/data_ingest")
+              LOG_DIR = os.path.join(DATA_INGEST_DIR, "logs")
+
+              REQUEST_TIMEOUT_SECONDS = int(os.environ.get("INGEST_TIMEOUT", "15"))
+              MAX_RETRIES = int(os.environ.get("INGEST_MAX_RETRIES", "3"))
+              RETRY_BACKOFF_SECONDS = float(os.environ.get("INGEST_RETRY_BACKOFF", "2"))
+
+
+              def filename_for_now(now=None):
+                  import datetime
+                  now = now or datetime.datetime.now()
+                  return now.strftime("%m%d%Y_%H%M") + ".txt"
+              PYEOF
+              chown ec2-user:ec2-user /data_ingest/ingestion_config.py
+              chmod 750 /data_ingest/ingestion_config.py
+
+              cat > /data_ingest/README_NEXT_STEPS.txt << 'TXTEOF'
+              This instance was bootstrapped by CloudFormation:
+                - /data_ingest exists with execute permission (750)
+                - Python 3.11 + a venv with boto3/requests/beautifulsoup4/lxml are installed
+                - ingestion_config.py is already filled in with this stack's real NLB DNS
+                  name and bucket names (via /etc/profile.d/ingestion_env.sh)
+
+              Still to do (see SWDD Section 7.8, or scp/SSM the two files from your
+              workstation): copy api_ingestion.py and text_ingestion.py into
+              /data_ingest/, then run:
+                chmod 750 /data_ingest/api_ingestion.py /data_ingest/text_ingestion.py
+              TXTEOF
+              chown ec2-user:ec2-user /data_ingest/README_NEXT_STEPS.txt
+            - NlbDns: !GetAtt ProxyNetworkLoadBalancer.DNSName
+              BucketA: !Ref StorageBucketA
+              BucketB: !Ref StorageBucketB
+              BucketC: !Ref StorageBucketC
+
+Outputs:
+  VpcId:
+    Description: "VPC ID for the ingestion zone"
+    Value: !Ref VPC
+
+  ProxyPublicIp:
+    Description: "Elastic IP of the Squid Proxy (outbound internet egress point)"
+    Value: !Ref ProxyElasticIP
+
+  LoadBalancerDnsName:
+    Description: "Internal NLB DNS name - set as INGEST_LB_DNS / http(s)_proxy target for the ingestion scripts"
+    Value: !GetAtt ProxyNetworkLoadBalancer.DNSName
+
+  StorageBucketNames:
+    Description: "The three Storage Container bucket names, in the order the scripts write to them"
+    Value: !Sub "${StorageBucketA},${StorageBucketB},${StorageBucketC}"
+
+  IngestionEC2InstanceId:
+    Description: "Instance ID of the private ingestion instance (reach it via SSM Session Manager, not SSH -- it has no public IP)"
+    Value: !Ref IngestionEC2
+
+  IngestionEC2RoleArn:
+    Description: "IAM role ARN attached to the ingestion instance (S3 write access scoped to the 3 buckets only)"
+    Value: !GetAtt IngestionEC2Role.Arn
+
+  NextSteps:
+    Description: "What to do after `aws cloudformation deploy` finishes"
+    Value: >-
+      1) Create the api/ and text/ marker objects in each bucket (aws s3api put-object
+      --bucket <name> --key api/ and --key text/). 2) Copy api_ingestion.py and
+      text_ingestion.py onto the ingestion instance's /data_ingest/ via SSM Session Manager,
+      then chmod 750 them. 3) Run each script once to confirm objects land in all three
+      buckets. See SWDD Section 7 and 8 for the full checklist and screenshots to capture.
+      TEARDOWN: the buckets have no DeletionPolicy override (default Delete), but
+      CloudFormation still refuses to delete a non-empty bucket -- empty all three with
+      `aws s3 rm s3://<bucket> --recursive` before running `aws cloudformation delete-stack`,
+      or the deletion will roll back / get stuck.
